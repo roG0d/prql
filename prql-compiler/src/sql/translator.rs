@@ -24,6 +24,7 @@ use crate::ast::*;
 use crate::error::{Error, Reason};
 use crate::semantic::Context;
 use crate::utils::OrMap;
+use crate::utils::*;
 
 use super::materializer::MaterializationContext;
 use super::{distinct, un_group, MaterializedFrame};
@@ -72,6 +73,8 @@ pub fn translate_query(query: Query, context: Context) -> Result<sql_ast::Query>
         });
     }
 
+    let dialect = query.dialect.handler();
+
     // take last table
     if materialized.is_empty() {
         bail!("No tables?");
@@ -82,11 +85,11 @@ pub fn translate_query(query: Query, context: Context) -> Result<sql_ast::Query>
     // convert each of the CTEs
     let ctes: Vec<_> = ctes
         .into_iter()
-        .map(|t| table_to_sql_cte(t, &query.dialect))
+        .map(|t| table_to_sql_cte(t, dialect.as_ref()))
         .try_collect()?;
 
     // convert main query
-    let mut main_query = sql_query_of_atomic_table(main_query, &query.dialect)?;
+    let mut main_query = sql_query_of_atomic_table(main_query, dialect.as_ref())?;
 
     // attach CTEs
     if !ctes.is_empty() {
@@ -120,9 +123,9 @@ fn into_tables(nodes: Vec<Node>) -> Result<Vec<Table>> {
     Ok([tables, vec![transforms.into()]].concat())
 }
 
-fn table_to_sql_cte(table: AtomicTable, dialect: &Dialect) -> Result<sql_ast::Cte> {
+fn table_to_sql_cte(table: AtomicTable, dialect: &dyn DialectHandler) -> Result<sql_ast::Cte> {
     let alias = sql_ast::TableAlias {
-        name: Item::Ident(table.name.clone().unwrap().name).try_into()?,
+        name: sql_ast::Ident::new(table.name.clone().unwrap().name),
         columns: vec![],
     };
     Ok(sql_ast::Cte {
@@ -132,13 +135,11 @@ fn table_to_sql_cte(table: AtomicTable, dialect: &Dialect) -> Result<sql_ast::Ct
     })
 }
 
-fn table_factor_of_table_ref(table_ref: &TableRef) -> TableFactor {
+fn table_factor_of_table_ref(table_ref: &TableRef, dialect: &dyn DialectHandler) -> TableFactor {
     TableFactor::Table {
-        name: ObjectName(vec![Item::Ident(table_ref.name.clone())
-            .try_into()
-            .unwrap()]),
+        name: sql_ast::ObjectName(translate_ident(table_ref.name.clone(), dialect)),
         alias: table_ref.alias.clone().map(|a| TableAlias {
-            name: Item::Ident(a).try_into().unwrap(),
+            name: sql_ast::Ident::new(a),
             columns: vec![],
         }),
         args: None,
@@ -148,7 +149,10 @@ fn table_factor_of_table_ref(table_ref: &TableRef) -> TableFactor {
 
 // impl Translator for
 // fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sql_ast::Query> {
-fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sql_ast::Query> {
+fn sql_query_of_atomic_table(
+    table: AtomicTable,
+    dialect: &dyn DialectHandler,
+) -> Result<sql_ast::Query> {
     let frame = table.frame.ok_or_else(|| anyhow!("frame not provided?"))?;
 
     let transforms = table.pipeline.into_transforms()?;
@@ -157,7 +161,7 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
         .iter()
         .filter_map(|t| match t {
             Transform::From(table_ref) => Some(TableWithJoins {
-                relation: table_factor_of_table_ref(table_ref),
+                relation: table_factor_of_table_ref(table_ref, dialect),
                 joins: vec![],
             }),
             _ => None,
@@ -167,7 +171,7 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
     let joins = transforms
         .iter()
         .filter(|t| matches!(t, Transform::Join { .. }))
-        .map(Join::try_from)
+        .map(|j| translate_join(j, dialect))
         .collect::<Result<Vec<_>>>()?;
     if !joins.is_empty() {
         if let Some(from) = from.last_mut() {
@@ -185,8 +189,8 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
     let (before, after) = transforms.split_at(aggregate_position);
 
     // Find the filters that come before the aggregation.
-    let where_ = filter_of_pipeline(before)?;
-    let having = filter_of_pipeline(after)?;
+    let where_ = filter_of_pipeline(before, dialect)?;
+    let having = filter_of_pipeline(after, dialect)?;
 
     let takes = transforms
         .iter()
@@ -203,7 +207,7 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
         None
     } else {
         Some(sqlparser::ast::Offset {
-            value: Item::Literal(Literal::Integer(offset)).try_into()?,
+            value: translate_item(Item::Literal(Literal::Integer(offset)), dialect)?,
             rows: sqlparser::ast::OffsetRows::None,
         })
     };
@@ -211,7 +215,7 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
     // Use sorting from the frame
     let order_by = (frame.sort)
         .into_iter()
-        .map(OrderByExpr::try_from)
+        .map(|s| translate_column_sort(s, dialect))
         .try_collect()?;
 
     let aggregate = transforms.get(aggregate_position);
@@ -221,7 +225,6 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
         None => vec![],
         _ => unreachable!("Expected an aggregate transformation"),
     };
-    let dialect = dialect.handler();
 
     let distinct = transforms.iter().any(|t| matches!(t, Transform::Unique));
 
@@ -229,18 +232,18 @@ fn sql_query_of_atomic_table(table: AtomicTable, dialect: &Dialect) -> Result<sq
         body: SetExpr::Select(Box::new(Select {
             distinct,
             top: if dialect.use_top() {
-                limit.map(top_of_i64)
+                limit.map(|l| top_of_i64(l, dialect))
             } else {
                 None
             },
             projection: (frame.columns.into_iter())
-                .map(|n| n.item.try_into())
+                .map(|n| translate_select_item(n.item, dialect))
                 .try_collect()?,
             into: None,
             from,
             lateral_views: vec![],
             selection: where_,
-            group_by: try_into_exprs(group_bys)?,
+            group_by: try_into_exprs(group_bys, dialect)?,
             cluster_by: vec![],
             distribute_by: vec![],
             sort_by: vec![],
@@ -410,7 +413,10 @@ fn range_of_ranges(ranges: Vec<Range>) -> Result<Range<i64>> {
     Ok(current)
 }
 
-fn filter_of_pipeline(pipeline: &[Transform]) -> Result<Option<Expr>> {
+fn filter_of_pipeline(
+    pipeline: &[Transform],
+    dialect: &dyn DialectHandler,
+) -> Result<Option<Expr>> {
     let filters: Vec<Node> = pipeline
         .iter()
         .filter_map(|t| match t {
@@ -418,10 +424,10 @@ fn filter_of_pipeline(pipeline: &[Transform]) -> Result<Option<Expr>> {
             _ => None,
         })
         .collect();
-    filter_of_filters(filters)
+    filter_of_filters(filters, dialect)
 }
 
-fn filter_of_filters(conditions: Vec<Node>) -> Result<Option<Expr>> {
+fn filter_of_filters(conditions: Vec<Node>, dialect: &dyn DialectHandler) -> Result<Option<Expr>> {
     let mut condition = None;
     for filter in conditions {
         if let Some(left) = condition {
@@ -435,7 +441,9 @@ fn filter_of_filters(conditions: Vec<Node>) -> Result<Option<Expr>> {
         }
     }
 
-    condition.map(|n| n.item.try_into()).transpose()
+    condition
+        .map(|n| translate_item(n.item, dialect))
+        .transpose()
 }
 
 fn expr_of_i64(number: i64) -> Expr {
@@ -445,208 +453,212 @@ fn expr_of_i64(number: i64) -> Expr {
     ))
 }
 
-fn top_of_i64(take: i64) -> Top {
+fn top_of_i64(take: i64, dialect: &dyn DialectHandler) -> Top {
     Top {
-        quantity: Some(Item::Literal(Literal::Integer(take)).try_into().unwrap()),
+        quantity: Some(translate_item(Item::Literal(Literal::Integer(take)), dialect).unwrap()),
         with_ties: false,
         percent: false,
     }
 }
-fn try_into_exprs(nodes: Vec<Node>) -> Result<Vec<Expr>> {
+fn try_into_exprs(nodes: Vec<Node>, dialect: &dyn DialectHandler) -> Result<Vec<Expr>> {
     nodes
         .into_iter()
         .map(|x| x.item)
-        .map(Expr::try_from)
+        .map(|item| translate_item(item, dialect))
         .try_collect()
 }
 
-impl TryFrom<Item> for SelectItem {
-    type Error = anyhow::Error;
-    fn try_from(item: Item) -> Result<Self> {
-        Ok(match item {
-            Item::Binary { .. }
-            | Item::Unary { .. }
-            | Item::SString(_)
-            | Item::FString(_)
-            | Item::Ident(_)
-            | Item::Literal(_)
-            | Item::Windowed(_) => SelectItem::UnnamedExpr(Expr::try_from(item)?),
-            Item::Assign(named) => SelectItem::ExprWithAlias {
-                alias: sql_ast::Ident::new(named.name),
-                expr: named.expr.item.try_into()?,
-            },
-            _ => bail!("Can't convert to SelectItem; {:?}", item),
-        })
-    }
+fn translate_select_item(item: Item, dialect: &dyn DialectHandler) -> Result<SelectItem> {
+    Ok(match item {
+        Item::Binary { .. }
+        | Item::Unary { .. }
+        | Item::SString(_)
+        | Item::FString(_)
+        | Item::Ident(_)
+        | Item::Literal(_)
+        | Item::Windowed(_) => SelectItem::UnnamedExpr(translate_item(item, dialect)?),
+        Item::Assign(named) => SelectItem::ExprWithAlias {
+            alias: translate_ident_part(named.name, dialect),
+            expr: translate_item(named.expr.item, dialect)?,
+        },
+        _ => bail!("Can't convert to SelectItem; {:?}", item),
+    })
 }
-impl TryFrom<Item> for Expr {
-    type Error = anyhow::Error;
-    fn try_from(item: Item) -> Result<Self> {
-        Ok(match item {
-            Item::Ident(_) => Expr::Identifier(item.try_into()?),
 
-            // do we need to surround operations with parentheses?
-            Item::Binary { op, left, right } => {
-                if let Some(is_null) = try_into_is_null(&op, &left, &right)? {
-                    is_null
-                } else {
-                    Expr::BinaryOp {
-                        left: Box::new(left.item.try_into()?),
-                        op: match op {
-                            BinOp::Mul => BinaryOperator::Multiply,
-                            BinOp::Div => BinaryOperator::Divide,
-                            BinOp::Mod => BinaryOperator::Modulo,
-                            BinOp::Add => BinaryOperator::Plus,
-                            BinOp::Sub => BinaryOperator::Minus,
-                            BinOp::Eq => BinaryOperator::Eq,
-                            BinOp::Ne => BinaryOperator::NotEq,
-                            BinOp::Gt => BinaryOperator::Gt,
-                            BinOp::Lt => BinaryOperator::Lt,
-                            BinOp::Gte => BinaryOperator::GtEq,
-                            BinOp::Lte => BinaryOperator::LtEq,
-                            BinOp::And => BinaryOperator::And,
-                            BinOp::Or => BinaryOperator::Or,
-                            BinOp::Coalesce => unreachable!(),
-                        },
-                        right: Box::new(right.item.try_into()?),
+fn translate_item(item: Item, dialect: &dyn DialectHandler) -> Result<Expr> {
+    Ok(match item {
+        Item::Ident(ident) => Expr::CompoundIdentifier(translate_ident(ident, dialect)),
+
+        Item::Binary { op, left, right } => {
+            if let Some(is_null) = try_into_is_null(&op, &left, &right, dialect)? {
+                is_null
+            } else {
+                let op = match op {
+                    BinOp::Mul => BinaryOperator::Multiply,
+                    BinOp::Div => BinaryOperator::Divide,
+                    BinOp::Mod => BinaryOperator::Modulo,
+                    BinOp::Add => BinaryOperator::Plus,
+                    BinOp::Sub => BinaryOperator::Minus,
+                    BinOp::Eq => BinaryOperator::Eq,
+                    BinOp::Ne => BinaryOperator::NotEq,
+                    BinOp::Gt => BinaryOperator::Gt,
+                    BinOp::Lt => BinaryOperator::Lt,
+                    BinOp::Gte => BinaryOperator::GtEq,
+                    BinOp::Lte => BinaryOperator::LtEq,
+                    BinOp::And => BinaryOperator::And,
+                    BinOp::Or => BinaryOperator::Or,
+                    BinOp::Coalesce => unreachable!(),
+                };
+                Expr::BinaryOp {
+                    left: translate_operand(left.item, op.binding_strength(), dialect)?,
+                    right: translate_operand(right.item, op.binding_strength(), dialect)?,
+                    op,
+                }
+            }
+        }
+
+        Item::Unary { op, expr } => {
+            let op = match op {
+                UnOp::Neg => UnaryOperator::Minus,
+                UnOp::Not => UnaryOperator::Not,
+            };
+            let expr = translate_operand(expr.item, op.binding_strength(), dialect)?;
+            Expr::UnaryOp { op, expr }
+        }
+
+        Item::Range(r) => {
+            fn assert_bound(bound: Option<Box<Node>>) -> Result<Node, Error> {
+                bound.map(|b| *b).ok_or_else(|| {
+                    Error::new(Reason::Simple(
+                        "range requires both bounds to be used this way".to_string(),
+                    ))
+                })
+            }
+            let start: Expr = translate_item(assert_bound(r.start)?.item, dialect)?;
+            let end: Expr = translate_item(assert_bound(r.end)?.item, dialect)?;
+            Expr::Identifier(sql_ast::Ident::new(format!("{} AND {}", start, end)))
+        }
+        // Fairly hacky — convert everything to a string, then concat it,
+        // then convert to Expr. We can't use the `Item::Expr` code above
+        // since we don't want to intersperse with spaces.
+        Item::SString(s_string_items) => {
+            let string = s_string_items
+                .into_iter()
+                .map(|s_string_item| match s_string_item {
+                    InterpolateItem::String(string) => Ok(string),
+                    InterpolateItem::Expr(node) => {
+                        translate_item(node.item, dialect).map(|expr| expr.to_string())
                     }
-                }
-            }
-
-            Item::Unary { op, expr: a } => Expr::UnaryOp {
-                op: match op {
-                    UnOp::Neg => UnaryOperator::Minus,
-                    UnOp::Not => UnaryOperator::Not,
-                },
-                expr: Box::new(a.item.try_into()?),
-            },
-
-            Item::Range(r) => {
-                fn assert_bound(bound: Option<Box<Node>>) -> Result<Node, Error> {
-                    bound.map(|b| *b).ok_or_else(|| {
-                        Error::new(Reason::Simple(
-                            "range requires both bounds to be used this way".to_string(),
-                        ))
-                    })
-                }
-                let start: Expr = assert_bound(r.start)?.item.try_into()?;
-                let end: Expr = assert_bound(r.end)?.item.try_into()?;
-                Expr::Identifier(sql_ast::Ident::new(format!("{} AND {}", start, end)))
-            }
-            // Fairly hacky — convert everything to a string, then concat it,
-            // then convert to Expr. We can't use the `Item::Expr` code above
-            // since we don't want to intersperse with spaces.
-            Item::SString(s_string_items) => {
-                let string = s_string_items
-                    .into_iter()
-                    .map(|s_string_item| match s_string_item {
-                        InterpolateItem::String(string) => Ok(string),
-                        InterpolateItem::Expr(node) => {
-                            Expr::try_from(node.item).map(|expr| expr.to_string())
-                        }
-                    })
-                    .collect::<Result<Vec<String>>>()?
-                    .join("");
-                Item::Ident(string).try_into()?
-            }
-            Item::FString(f_string_items) => {
-                let args = f_string_items
-                    .into_iter()
-                    .map(|item| match item {
-                        InterpolateItem::String(string) => {
-                            Ok(Expr::Value(Value::SingleQuotedString(string)))
-                        }
-                        InterpolateItem::Expr(node) => Expr::try_from(node.item),
-                    })
-                    .map(|r| r.map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e))))
-                    .collect::<Result<Vec<_>>>()?;
-
-                Expr::Function(Function {
-                    name: ObjectName(vec![sql_ast::Ident::new("CONCAT")]),
-                    args,
-                    distinct: false,
-                    over: None,
                 })
-            }
-            Item::Interval(interval) => {
-                let sql_parser_datetime = match interval.unit.as_str() {
-                    "years" => DateTimeField::Year,
-                    "months" => DateTimeField::Month,
-                    "days" => DateTimeField::Day,
-                    "hours" => DateTimeField::Hour,
-                    "minutes" => DateTimeField::Minute,
-                    "seconds" => DateTimeField::Second,
-                    _ => bail!("Unsupported interval unit: {}", interval.unit),
-                };
-                Expr::Value(Value::Interval {
-                    value: interval.n.to_string(),
-                    leading_field: Some(sql_parser_datetime),
-                    leading_precision: None,
-                    last_field: None,
-                    fractional_seconds_precision: None,
+                .collect::<Result<Vec<String>>>()?
+                .join("");
+            Expr::Identifier(sql_ast::Ident::new(string))
+        }
+        Item::FString(f_string_items) => {
+            let args = f_string_items
+                .into_iter()
+                .map(|item| match item {
+                    InterpolateItem::String(string) => {
+                        Ok(Expr::Value(Value::SingleQuotedString(string)))
+                    }
+                    InterpolateItem::Expr(node) => translate_item(node.item, dialect),
                 })
-            }
-            Item::Windowed(window) => {
-                let expr = Expr::try_from(window.expr.item)?;
+                .map(|r| r.map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e))))
+                .collect::<Result<Vec<_>>>()?;
 
-                let default_frame = if window.sort.is_empty() {
-                    (WindowKind::Rows, Range::unbounded())
+            Expr::Function(Function {
+                name: ObjectName(vec![sql_ast::Ident::new("CONCAT")]),
+                args,
+                distinct: false,
+                over: None,
+            })
+        }
+        Item::Interval(interval) => {
+            let sql_parser_datetime = match interval.unit.as_str() {
+                "years" => DateTimeField::Year,
+                "months" => DateTimeField::Month,
+                "days" => DateTimeField::Day,
+                "hours" => DateTimeField::Hour,
+                "minutes" => DateTimeField::Minute,
+                "seconds" => DateTimeField::Second,
+                _ => bail!("Unsupported interval unit: {}", interval.unit),
+            };
+            Expr::Value(Value::Interval {
+                value: interval.n.to_string(),
+                leading_field: Some(sql_parser_datetime),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            })
+        }
+        Item::Windowed(window) => {
+            let expr = translate_item(window.expr.item, dialect)?;
+
+            let default_frame = if window.sort.is_empty() {
+                (WindowKind::Rows, Range::unbounded())
+            } else {
+                (WindowKind::Range, Range::from_ints(None, Some(0)))
+            };
+
+            let window = WindowSpec {
+                partition_by: try_into_exprs(window.group, dialect)?,
+                order_by: (window.sort)
+                    .into_iter()
+                    .map(|s| translate_column_sort(s, dialect))
+                    .try_collect()?,
+                window_frame: if window.window == default_frame {
+                    None
                 } else {
-                    (WindowKind::Range, Range::from_ints(None, Some(0)))
-                };
+                    Some(try_into_window_frame(window.window)?)
+                },
+            };
 
-                let window = WindowSpec {
-                    partition_by: try_into_exprs(window.group)?,
-                    order_by: (window.sort)
-                        .into_iter()
-                        .map(OrderByExpr::try_from)
-                        .try_collect()?,
-                    window_frame: if window.window == default_frame {
-                        None
-                    } else {
-                        Some(try_into_window_frame(window.window)?)
-                    },
-                };
-
-                Item::Ident(format!("{expr} OVER ({window})")).try_into()?
-            }
-            Item::Literal(l) => match l {
-                Literal::Null => Expr::Value(Value::Null),
-                Literal::String(s) => Expr::Value(Value::SingleQuotedString(s)),
-                Literal::Boolean(b) => Expr::Value(Value::Boolean(b)),
-                Literal::Float(f) => Expr::Value(Value::Number(format!("{f}"), false)),
-                Literal::Integer(i) => Expr::Value(Value::Number(format!("{i}"), false)),
-                Literal::Date(value) => Expr::TypedString {
-                    data_type: sql_ast::DataType::Date,
-                    value,
-                },
-                Literal::Time(value) => Expr::TypedString {
-                    data_type: sql_ast::DataType::Time,
-                    value,
-                },
-                Literal::Timestamp(value) => Expr::TypedString {
-                    data_type: sql_ast::DataType::Timestamp,
-                    value,
-                },
+            Expr::Identifier(sql_ast::Ident::new(format!("{expr} OVER ({window})")))
+        }
+        Item::Literal(l) => match l {
+            Literal::Null => Expr::Value(Value::Null),
+            Literal::String(s) => Expr::Value(Value::SingleQuotedString(s)),
+            Literal::Boolean(b) => Expr::Value(Value::Boolean(b)),
+            Literal::Float(f) => Expr::Value(Value::Number(format!("{f}"), false)),
+            Literal::Integer(i) => Expr::Value(Value::Number(format!("{i}"), false)),
+            Literal::Date(value) => Expr::TypedString {
+                data_type: sql_ast::DataType::Date,
+                value,
             },
-            _ => bail!("Can't convert to Expr; {item:?}"),
-        })
-    }
+            Literal::Time(value) => Expr::TypedString {
+                data_type: sql_ast::DataType::Time,
+                value,
+            },
+            Literal::Timestamp(value) => Expr::TypedString {
+                data_type: sql_ast::DataType::Timestamp,
+                value,
+            },
+        },
+        _ => bail!("Can't convert to Expr; {item:?}"),
+    })
 }
-fn try_into_is_null(op: &BinOp, a: &Node, b: &Node) -> Result<Option<Expr>> {
+fn try_into_is_null(
+    op: &BinOp,
+    a: &Node,
+    b: &Node,
+    dialect: &dyn DialectHandler,
+) -> Result<Option<Expr>> {
     if matches!(op, BinOp::Eq) || matches!(op, BinOp::Ne) {
         let expr = if matches!(a.item, Item::Literal(Literal::Null)) {
-            Expr::try_from(b.item.clone())?
+            b.item.clone()
         } else if matches!(b.item, Item::Literal(Literal::Null)) {
-            Expr::try_from(a.item.clone())?
+            a.item.clone()
         } else {
             return Ok(None);
         };
 
+        let min_strength = Expr::IsNull(Box::new(Expr::Value(Value::Null))).binding_strength();
+        let expr = translate_operand(expr, min_strength, dialect)?;
+
         return Ok(Some(if matches!(op, BinOp::Eq) {
-            Expr::IsNull(Box::new(expr))
+            Expr::IsNull(expr)
         } else {
-            Expr::IsNotNull(Box::new(expr))
+            Expr::IsNotNull(expr)
         }));
     }
 
@@ -680,81 +692,179 @@ fn try_into_window_frame((kind, range): (WindowKind, Range)) -> Result<sql_ast::
     })
 }
 
-impl TryFrom<FuncCall> for Function {
-    // I had an idea to for stdlib functions to have "native" keyword, which would prevent them from being
-    // resolved and materialized and would be passed to here. But that has little advantage over current approach.
-    // After some time when we know that current approach is good, this impl can be removed.
-    type Error = anyhow::Error;
-    fn try_from(func_call: FuncCall) -> Result<Self> {
-        let FuncCall { name, args, .. } = func_call;
+// I had an idea to for stdlib functions to have "native" keyword, which would prevent them from being
+// resolved and materialized and would be passed to here. But that has little advantage over current approach.
+// After some time when we know that current approach is good, this impl can be removed.
+#[allow(dead_code)]
+fn translate_func_call(func_call: FuncCall, dialect: &dyn DialectHandler) -> Result<Function> {
+    let FuncCall { name, args, .. } = func_call;
 
-        Ok(Function {
-            name: ObjectName(vec![sql_ast::Ident::new(name)]),
-            args: args
-                .into_iter()
-                .map(|a| Expr::try_from(a.item))
-                .map(|e| e.map(|a| FunctionArg::Unnamed(FunctionArgExpr::Expr(a))))
-                .collect::<Result<Vec<_>>>()?,
-            over: None,
-            distinct: false,
-        })
+    Ok(Function {
+        name: ObjectName(vec![sql_ast::Ident::new(name)]),
+        args: args
+            .into_iter()
+            .map(|a| translate_item(a.item, dialect))
+            .map(|e| e.map(|a| FunctionArg::Unnamed(FunctionArgExpr::Expr(a))))
+            .collect::<Result<Vec<_>>>()?,
+        over: None,
+        distinct: false,
+    })
+}
+fn translate_column_sort(sort: ColumnSort, dialect: &dyn DialectHandler) -> Result<OrderByExpr> {
+    Ok(OrderByExpr {
+        expr: translate_item(sort.column.item, dialect)?,
+        asc: if matches!(sort.direction, SortDirection::Asc) {
+            None // default order is ASC, so there is no need to emit it
+        } else {
+            Some(false)
+        },
+        nulls_first: None,
+    })
+}
+
+fn translate_join(t: &Transform, dialect: &dyn DialectHandler) -> Result<Join> {
+    match t {
+        Transform::Join { side, with, filter } => {
+            let constraint = match filter {
+                JoinFilter::On(nodes) => JoinConstraint::On(
+                    filter_of_filters(nodes.clone(), dialect)?
+                        .unwrap_or(Expr::Value(Value::Boolean(true))),
+                ),
+                JoinFilter::Using(nodes) => JoinConstraint::Using(
+                    nodes
+                        .iter()
+                        .map(|x| translate_ident(x.item.clone().into_ident()?, dialect).into_only())
+                        .collect::<Result<Vec<_>>>()
+                        .map_err(|_| {
+                            Error::new(Reason::Expected {
+                                who: Some("join".to_string()),
+                                expected: "An identifer with only one part; no `.`".to_string(),
+                                // TODO: Add in the actual item (but I couldn't
+                                // get the error types to agree)
+                                found: "A multipart identifer".to_string(),
+                            })
+                        })?,
+                ),
+            };
+
+            Ok(Join {
+                relation: table_factor_of_table_ref(with, dialect),
+                join_operator: match *side {
+                    JoinSide::Inner => JoinOperator::Inner(constraint),
+                    JoinSide::Left => JoinOperator::LeftOuter(constraint),
+                    JoinSide::Right => JoinOperator::RightOuter(constraint),
+                    JoinSide::Full => JoinOperator::FullOuter(constraint),
+                },
+            })
+        }
+        _ => unreachable!(),
     }
 }
-impl TryFrom<ColumnSort> for OrderByExpr {
-    type Error = anyhow::Error;
-    fn try_from(sort: ColumnSort) -> Result<Self> {
-        Ok(OrderByExpr {
-            expr: sort.column.item.try_into()?,
-            asc: if matches!(sort.direction, SortDirection::Asc) {
-                None // default order is ASC, so there is no need to emit it
-            } else {
-                Some(false)
-            },
-            nulls_first: None,
-        })
+
+/// Translate an PRQL Ident to a Vec of SQL Idents.
+// We return a vec of SQL Idents because sqlparser sometimes uses
+// [ObjectName](sql_ast::ObjectName) and sometimes uses
+// [Expr::CompoundIdentifier](sql_ast::Expr::CompoundIdentifier), each of which
+// are `Vec<Ident>`.
+fn translate_ident(ident: String, dialect: &dyn DialectHandler) -> Vec<sql_ast::Ident> {
+    let is_jinja = ident.starts_with("{{") && ident.ends_with("}}");
+
+    if !is_jinja {
+        ident
+            .split('.')
+            .map(|x| translate_ident_part(x.to_string(), dialect))
+            .collect()
+    } else {
+        vec![sql_ast::Ident::new(ident)]
     }
 }
-impl TryFrom<&Transform> for Join {
-    type Error = anyhow::Error;
-    fn try_from(t: &Transform) -> Result<Join> {
-        match t {
-            Transform::Join { side, with, filter } => {
-                let constraint = match filter {
-                    JoinFilter::On(nodes) => JoinConstraint::On(
-                        filter_of_filters(nodes.clone())?
-                            .unwrap_or(Expr::Value(Value::Boolean(true))),
-                    ),
-                    JoinFilter::Using(nodes) => JoinConstraint::Using(
-                        nodes
-                            .iter()
-                            .map(|x| x.item.clone().try_into())
-                            .collect::<Result<Vec<_>>>()?,
-                    ),
-                };
 
-                Ok(Join {
-                    relation: table_factor_of_table_ref(with),
-                    join_operator: match *side {
-                        JoinSide::Inner => JoinOperator::Inner(constraint),
-                        JoinSide::Left => JoinOperator::LeftOuter(constraint),
-                        JoinSide::Right => JoinOperator::RightOuter(constraint),
-                        JoinSide::Full => JoinOperator::FullOuter(constraint),
-                    },
-                })
-            }
-            _ => unreachable!(),
+fn translate_ident_part(ident: String, dialect: &dyn DialectHandler) -> sql_ast::Ident {
+    // TODO: can probably represent these with a single regex
+    fn starting_forbidden(c: char) -> bool {
+        !(('a'..='z').contains(&c) || matches!(c, '_' | '$'))
+    }
+    fn subsequent_forbidden(c: char) -> bool {
+        !(('a'..='z').contains(&c) || ('0'..='9').contains(&c) || matches!(c, '_' | '$'))
+    }
+
+    let is_asterisk = ident == "*";
+
+    if !is_asterisk
+        && (ident.is_empty()
+            || ident.starts_with(starting_forbidden)
+            || (ident.chars().count() > 1 && ident.contains(subsequent_forbidden)))
+    {
+        sql_ast::Ident::with_quote(dialect.ident_quote(), ident)
+    } else {
+        sql_ast::Ident::new(ident)
+    }
+}
+
+/// Wraps into parenthesis if binding strength would be less than min_strength
+fn translate_operand(
+    expr: Item,
+    min_strength: i32,
+    dialect: &dyn DialectHandler,
+) -> Result<Box<Expr>> {
+    let expr = Box::new(translate_item(expr, dialect)?);
+
+    Ok(if expr.binding_strength() < min_strength {
+        Box::new(Expr::Nested(expr))
+    } else {
+        expr
+    })
+}
+
+trait SQLExpression {
+    /// Returns binding strength of an SQL expression
+    /// https://www.postgresql.org/docs/14/sql-syntax-lexical.html#id-1.5.3.5.13.2
+    /// https://docs.microsoft.com/en-us/sql/t-sql/language-elements/operator-precedence-transact-sql?view=sql-server-ver16
+    fn binding_strength(&self) -> i32;
+}
+impl SQLExpression for Expr {
+    fn binding_strength(&self) -> i32 {
+        // Strength of an expression depends only on the top-level operator, because all
+        // other nested expressions can only have lower strength
+        match self {
+            Expr::BinaryOp { op, .. } => op.binding_strength(),
+
+            Expr::UnaryOp { op, .. } => op.binding_strength(),
+
+            Expr::IsNull(_) | Expr::IsNotNull(_) => 5,
+
+            // all other items types bind stronger (function calls, literals, ...)
+            _ => 20,
         }
     }
 }
-impl TryFrom<Item> for sql_ast::Ident {
-    type Error = anyhow::Error;
-    fn try_from(item: Item) -> Result<Self> {
-        Ok(match item {
-            Item::Ident(ident) => sql_ast::Ident::new(ident),
-            _ => bail!("Can't convert to Ident; {item:?}"),
-        })
+impl SQLExpression for BinaryOperator {
+    fn binding_strength(&self) -> i32 {
+        use BinaryOperator::*;
+        match self {
+            Modulo | Multiply | Divide => 11,
+            Minus | Plus => 10,
+
+            ILike | NotILike | Like | NotLike => 7,
+            Gt | Lt | GtEq | LtEq | Eq | NotEq => 6,
+
+            And => 3,
+            Or => 2,
+
+            _ => 9,
+        }
     }
 }
+impl SQLExpression for UnaryOperator {
+    fn binding_strength(&self) -> i32 {
+        match self {
+            UnaryOperator::Minus | UnaryOperator::Plus => 13,
+            UnaryOperator::Not => 4,
+            _ => 9,
+        }
+    }
+}
+
 impl From<Vec<Node>> for Table {
     fn from(functions: Vec<Node>) -> Self {
         Table {
@@ -777,10 +887,8 @@ impl From<Vec<Node>> for AtomicTable {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{parser::parse, resolve_and_translate, resolve_names, sql::load_std_lib};
-    use insta::{
-        assert_debug_snapshot, assert_display_snapshot, assert_snapshot, assert_yaml_snapshot,
-    };
+    use crate::{parser::parse, resolve, resolve_and_translate};
+    use insta::{assert_display_snapshot, assert_snapshot, assert_yaml_snapshot};
     use serde_yaml::from_str;
 
     #[test]
@@ -913,6 +1021,7 @@ mod test {
 
     #[test]
     fn test_try_from_s_string_to_expr() -> Result<()> {
+        let dialect = Dialect::Generic.handler();
         let ast: Node = from_str(
             r"
         SString:
@@ -922,7 +1031,7 @@ mod test {
         - String: )
         ",
         )?;
-        let expr: Expr = ast.item.try_into()?;
+        let expr: Expr = translate_item(ast.item, dialect.as_ref())?;
         assert_yaml_snapshot!(
             expr, @r###"
         ---
@@ -966,37 +1075,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_try_from_list_to_vec_expr() -> Result<()> {
-        let items = vec![
-            Item::Ident("a".to_owned()).into(),
-            Item::Ident("b".to_owned()).into(),
-        ];
-        let expr: Vec<Expr> = try_into_exprs(items)?;
-        assert_debug_snapshot!(expr, @r###"
-        [
-            Identifier(
-                Ident {
-                    value: "a",
-                    quote_style: None,
-                },
-            ),
-            Identifier(
-                Ident {
-                    value: "b",
-                    quote_style: None,
-                },
-            ),
-        ]
-        "###);
-        Ok(())
-    }
-
     fn parse_and_resolve(prql: &str) -> Result<Pipeline> {
-        let std_lib = load_std_lib()?;
-        let (_, context) = resolve_names(std_lib, None)?;
-
-        let (mut nodes, _) = resolve_names(parse(prql)?.nodes, Some(context))?;
+        let (mut nodes, _) = resolve(parse(prql)?.nodes, None)?;
         let pipeline = nodes.remove(nodes.len() - 1).coerce_to_pipeline();
         Ok(pipeline)
     }
@@ -1426,16 +1506,17 @@ take 20
             r###"
         prql dialect:generic
         from Employees
-        select [FirstName]
+        select [FirstName, `last name`]
         take 3
         "###,
         )?;
 
         assert_display_snapshot!((resolve_and_translate(query)?), @r###"
         SELECT
-          FirstName
+          "FirstName",
+          "last name"
         FROM
-          Employees
+          "Employees"
         LIMIT
           3
         "###);
@@ -1445,17 +1526,80 @@ take 20
             r###"
         prql dialect:mssql
         from Employees
-        select [FirstName]
+        select [FirstName, `last name`]
         take 3
         "###,
         )?;
 
         assert_display_snapshot!((resolve_and_translate(query)?), @r###"
         SELECT
-          TOP (3) FirstName
+          TOP (3) "FirstName",
+          "last name"
         FROM
-          Employees
+          "Employees"
         "###);
+
+        // MySQL
+        let query: Query = parse(
+            r###"
+        prql dialect:mysql
+        from Employees
+        select [FirstName, `last name`]
+        take 3
+        "###,
+        )?;
+
+        assert_display_snapshot!((resolve_and_translate(query)?), @r###"
+        SELECT
+          `FirstName`,
+          `last name`
+        FROM
+          `Employees`
+        LIMIT
+          3
+        "###);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ident_escaping() -> Result<()> {
+        // Generic
+        let query: Query = parse(
+            r###"
+        from `anim"ls`
+        derive [`čebela` = BeeName, medved = `bear's_name`]
+        "###,
+        )?;
+
+        assert_display_snapshot!((resolve_and_translate(query)?), @r###"
+        SELECT
+          "anim""ls".*,
+          "BeeName" AS "čebela",
+          "bear's_name" AS medved
+        FROM
+          "anim""ls"
+        "###);
+
+        // MySQL
+        let query: Query = parse(
+            r###"
+        prql dialect:mysql
+
+        from `anim"ls`
+        derive [`čebela` = BeeName, medved = `bear's_name`]
+        "###,
+        )?;
+
+        assert_display_snapshot!((resolve_and_translate(query)?), @r###"
+        SELECT
+          `anim"ls`.*,
+          `BeeName` AS `čebela`,
+          `bear's_name` AS medved
+        FROM
+          `anim"ls`
+        "###);
+
         Ok(())
     }
 
@@ -1509,6 +1653,23 @@ take 20
         )?;
 
         assert!(resolve_and_translate(query).is_err());
+
+        let query: Query = parse(
+            r###"
+        from events
+        filter (date | in @1776-07-04..@1787-09-17)
+        "###,
+        )?;
+
+        assert_display_snapshot!((resolve_and_translate(query)?), @r###"
+        SELECT
+          events.*
+        FROM
+          events
+        WHERE
+          date BETWEEN DATE '1776-07-04'
+          AND DATE '1787-09-17'
+        "###);
 
         Ok(())
     }
@@ -2084,7 +2245,7 @@ take 20
         WITH table_0 AS (
           SELECT
             employees.*,
-            ROW_NUMBER() OVER (PARTITION BY department) AS _rn
+            ROW_NUMBER() OVER (PARTITION BY department) AS _rn_81
           FROM
             employees
         )
@@ -2093,7 +2254,7 @@ take 20
         FROM
           table_0
         WHERE
-          _rn <= 3
+          _rn_81 <= 3
         "###);
 
         assert_display_snapshot!((resolve_and_translate(parse(r###"
@@ -2108,7 +2269,7 @@ take 20
               PARTITION BY department
               ORDER BY
                 salary
-            ) AS _rn
+            ) AS _rn_82
           FROM
             employees
         )
@@ -2117,7 +2278,7 @@ take 20
         FROM
           table_0
         WHERE
-          _rn BETWEEN 2
+          _rn_82 BETWEEN 2
           AND 3
         "###);
     }
@@ -2137,6 +2298,113 @@ take 20
     }
 
     #[test]
+    fn test_join() -> Result<()> {
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from x
+        join y [id]
+        "###,
+        )?)?), @r###"
+        SELECT
+          x.*,
+          y.*,
+          id
+        FROM
+          x
+          JOIN y USING(id)
+        "###);
+
+        // TODO: is there a better way to format the errors? `anyhow::Error`
+        // doesn't seem to serialize. We'd really like to show and test the
+        // error messages in our test suite.
+        assert_snapshot!((resolve_and_translate(parse(r###"
+        from x
+        join y [x.id]
+        "###,
+        )?).unwrap_err().to_string()), @r###"Error { span: None, reason: Expected { who: Some("join"), expected: "An identifer with only one part; no `.`", found: "A multipart identifer" }, help: None }"###);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_precedence() -> Result<()> {
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from x
+        derive [
+          n = a + b,
+          r = a/n,
+        ]
+        select temp_c = (temp - 32) * 3
+        "###,
+        )?)?), @r###"
+        SELECT
+          (temp - 32) * 3 AS temp_c
+        FROM
+          x
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        func add a b -> a + b
+
+        from numbers
+        derive [sum_1 = a + b, sum_2 = add a b]
+        select [result = c * sum_1 + sum_2]
+        "###,
+        )?)?), @r###"
+        SELECT
+          c * (a + b) + a + b AS result
+        FROM
+          numbers
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from numbers
+        derive [g = -a]
+        select a * g
+        "###,
+        )?)?), @r###"
+        SELECT
+          a * - a
+        FROM
+          numbers
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from numbers
+        select negated_is_null = (!a) == null
+        "###,
+        )?)?), @r###"
+        SELECT
+          (NOT a) IS NULL AS negated_is_null
+        FROM
+          numbers
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from numbers
+        select is_not_null = !(a == null)
+        "###,
+        )?)?), @r###"
+        SELECT
+          NOT a IS NULL AS is_not_null
+        FROM
+          numbers
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from numbers
+        select (a + b) == null
+        "###
+        )?)?), @r###"
+        SELECT
+          a + b IS NULL
+        FROM
+          numbers
+        "###);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_pipelines() {
         assert_display_snapshot!((resolve_and_translate(parse(r###"
         from employees
@@ -2148,5 +2416,88 @@ take 20
         FROM
           employees
         "###);
+    }
+
+    #[test]
+    fn test_rn_ids_are_unique() {
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+        from y_orig
+        group [y_id] (
+          take 2 # take 1 uses `distinct` instead of partitioning, which might be a separate bug
+        )
+        group [x_id] (
+          take 3
+        )
+        "###,
+        ).unwrap()).unwrap()), @r###"
+        WITH table_0 AS (
+          SELECT
+            y_orig.*,
+            ROW_NUMBER() OVER (PARTITION BY y_id) AS _rn_82
+          FROM
+            y_orig
+        ),
+        table_1 AS (
+          SELECT
+            table_0.*,
+            ROW_NUMBER() OVER (PARTITION BY x_id) AS _rn_83
+          FROM
+            table_0
+          WHERE
+            _rn_82 <= 2
+        )
+        SELECT
+          table_1.*
+        FROM
+          table_1
+        WHERE
+          _rn_83 <= 3
+        "###);
+    }
+
+    #[test]
+    fn test_quoting() -> Result<()> {
+        // GH-#822
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+prql dialect:postgres
+from some_schema.tablename
+        "###,
+        )?)?), @r###"
+        SELECT
+          some_schema.tablename.*
+        FROM
+          some_schema.tablename
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+prql dialect:bigquery
+from db.schema.table
+join `db.schema.table2` [id]
+join `db.schema.t-able` [id]
+        "###,
+        )?)?), @r###"
+        SELECT
+          db.schema.table.*,
+          db.schema.table2.*,
+          db.schema.`t-able`.*,
+          id
+        FROM
+          db.schema.table
+          JOIN db.schema.table2 USING(id)
+          JOIN db.schema.`t-able` USING(id)
+        "###);
+
+        assert_display_snapshot!((resolve_and_translate(parse(r###"
+from table
+select `first name`
+        "###,
+        )?)?), @r###"
+        SELECT
+          "first name"
+        FROM
+          table
+        "###);
+
+        Ok(())
     }
 }

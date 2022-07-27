@@ -220,7 +220,14 @@ fn ast_of_parse_pair(pair: Pair<Rule>) -> Result<Option<Node>> {
                 pipeline: Box::new(pipeline),
             })
         }
-        Rule::ident | Rule::jinja => Item::Ident(pair.as_str().to_string()),
+        Rule::ident | Rule::jinja => {
+            let inner = pair.as_str();
+            let stripped = inner
+                .strip_prefix('`')
+                .and_then(|s| s.strip_suffix('`'))
+                .unwrap_or(inner);
+            Item::Ident(stripped.to_string())
+        }
 
         Rule::number => {
             let str = pair.as_str();
@@ -1454,8 +1461,10 @@ select [
     #[test]
     fn test_parse_backticks() -> Result<()> {
         let prql = "
-from `a.b`
+from `a`
 aggregate [max c]
+join `my-proj.dataset.table`
+join `my-proj`.`dataset`.`table`
 ";
         assert_yaml_snapshot!(parse(prql)?, @r###"
         ---
@@ -1467,7 +1476,7 @@ aggregate [max c]
                 - FuncCall:
                     name: from
                     args:
-                      - Ident: "`a.b`"
+                      - Ident: a
                     named_args: {}
                 - FuncCall:
                     name: aggregate
@@ -1478,6 +1487,16 @@ aggregate [max c]
                               args:
                                 - Ident: c
                               named_args: {}
+                    named_args: {}
+                - FuncCall:
+                    name: join
+                    args:
+                      - Ident: my-proj.dataset.table
+                    named_args: {}
+                - FuncCall:
+                    name: join
+                    args:
+                      - Ident: "my-proj`.`dataset`.`table"
                     named_args: {}
         "###);
 
@@ -1559,6 +1578,8 @@ aggregate [max c]
           less_than_ten = ..9,
           negative = (-5..),
           more_negative = -10..,
+          dates_open = @2020-01-01..,
+          dates = @2020-01-01..@2021-01-01,
         ]
         ").unwrap(), @r###"
         ---
@@ -1626,6 +1647,24 @@ aggregate [max c]
                                     Literal:
                                       Integer: -10
                                   end: ~
+                          - Assign:
+                              name: dates_open
+                              expr:
+                                Range:
+                                  start:
+                                    Literal:
+                                      Date: 2020-01-01
+                                  end: ~
+                          - Assign:
+                              name: dates
+                              expr:
+                                Range:
+                                  start:
+                                    Literal:
+                                      Date: 2020-01-01
+                                  end:
+                                    Literal:
+                                      Date: 2021-01-01
                     named_args: {}
         "###);
     }
@@ -1827,6 +1866,118 @@ aggregate [max c]
                       Literal:
                         Boolean: true
               named_args: {}
+        "###)
+    }
+
+    #[test]
+    fn test_parse_allowed_idents() {
+        assert_yaml_snapshot!(parse(r###"
+        from employees
+        join _salary [employee_id] # table with leading underscore
+        filter first_name == $1
+        select [_employees._underscored_column]
+        "###).unwrap(), @r###"
+        ---
+        version: ~
+        dialect: Generic
+        nodes:
+          - Pipeline:
+              nodes:
+                - FuncCall:
+                    name: from
+                    args:
+                      - Ident: employees
+                    named_args: {}
+                - FuncCall:
+                    name: join
+                    args:
+                      - Ident: _salary
+                      - List:
+                          - Ident: employee_id
+                    named_args: {}
+                - FuncCall:
+                    name: filter
+                    args:
+                      - Binary:
+                          left:
+                            Ident: first_name
+                          op: Eq
+                          right:
+                            Ident: $1
+                    named_args: {}
+                - FuncCall:
+                    name: select
+                    args:
+                      - List:
+                          - Ident: _employees._underscored_column
+                    named_args: {}
+        "###)
+    }
+
+    #[test]
+    fn test_parse_gt_lt_gte_lte() {
+        assert_yaml_snapshot!(parse(r###"
+        from people
+        filter age >= 100
+        filter num_grandchildren <= 10
+        filter salary > 0
+        filter num_eyes < 2
+        "###).unwrap(), @r###"
+        ---
+        version: ~
+        dialect: Generic
+        nodes:
+          - Pipeline:
+              nodes:
+                - FuncCall:
+                    name: from
+                    args:
+                      - Ident: people
+                    named_args: {}
+                - FuncCall:
+                    name: filter
+                    args:
+                      - Binary:
+                          left:
+                            Ident: age
+                          op: Gte
+                          right:
+                            Literal:
+                              Integer: 100
+                    named_args: {}
+                - FuncCall:
+                    name: filter
+                    args:
+                      - Binary:
+                          left:
+                            Ident: num_grandchildren
+                          op: Lte
+                          right:
+                            Literal:
+                              Integer: 10
+                    named_args: {}
+                - FuncCall:
+                    name: filter
+                    args:
+                      - Binary:
+                          left:
+                            Ident: salary
+                          op: Gt
+                          right:
+                            Literal:
+                              Integer: 0
+                    named_args: {}
+                - FuncCall:
+                    name: filter
+                    args:
+                      - Binary:
+                          left:
+                            Ident: num_eyes
+                          op: Lt
+                          right:
+                            Literal:
+                              Integer: 2
+                    named_args: {}
         "###)
     }
 }

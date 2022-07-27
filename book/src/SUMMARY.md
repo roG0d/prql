@@ -33,6 +33,11 @@
   - [Strings](./language-features/strings.md)
 
 - [Stdlib](./stdlib.md)
+- [Bindings](./bindings/README.md)
+  - [Java](./bindings/java.md)
+  - [JavaScript](./bindings/javascript.md)
+  - [Python](./bindings/python.md)
+  - [Rust](./bindings/rust.md)
 - [Integrations](./integrations/README.md)
 
   - [dbt](./integrations/dbt.md)
@@ -44,7 +49,6 @@
 - [Examples](./examples/README.md)
   - [Variables](./examples/variables.md)
   - [List equivalence](./examples/list-equivalence.md)
-  - [Functions](./examples/functions.md)
   - [CTE (intermediate tables)](./examples/cte.md)
   - [SQL parameters](./examples/sql-parameters.md)
   - [Employees](./examples/employees.md)

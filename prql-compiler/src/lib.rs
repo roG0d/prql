@@ -1,20 +1,19 @@
-mod ast;
+pub mod ast;
 #[cfg(feature = "cli")]
 mod cli;
 mod error;
 mod parser;
-mod semantic;
+pub mod semantic;
 mod sql;
 mod utils;
 
 pub use anyhow::Result;
-pub use ast::display;
 #[cfg(feature = "cli")]
 pub use cli::Cli;
 pub use error::{format_error, SourceLocation};
 pub use parser::parse;
-pub use semantic::*;
-pub use sql::{resolve_and_translate, translate};
+pub use semantic::resolve;
+pub use sql::translate;
 
 /// Compile a PRQL string into a SQL string.
 ///
@@ -26,13 +25,15 @@ pub fn compile(prql: &str) -> Result<String> {
     parse(prql).and_then(resolve_and_translate)
 }
 
-/// Format an PRQL query
-///
-/// This has two stages:
-/// - [parse] — Build an AST from a PRQL query string.
-/// - [display] — Write a AST back to string.
+pub fn resolve_and_translate(mut query: ast::Query) -> Result<String> {
+    let (nodes, context) = semantic::resolve(query.nodes, None)?;
+    query.nodes = nodes;
+    translate(query, context)
+}
+
+/// Format a PRQL query
 pub fn format(prql: &str) -> Result<String> {
-    parse(prql).map(display)
+    parse(prql).map(|q| format!("{}", ast::Item::Query(q)))
 }
 
 /// Compile a PRQL string into a JSON version of the Query.
@@ -40,15 +41,10 @@ pub fn to_json(prql: &str) -> Result<String> {
     Ok(serde_json::to_string(&parse(prql)?)?)
 }
 
-/// Exposes some library internals.
-///
-/// They are primarily exposed for documentation. There may be issues with using
-/// the exported items without items they rely on — feel free to request
-/// associated items be made public if required.
-pub mod internals {
-    pub use crate::ast::ast_fold::AstFold;
-    pub use crate::ast::Node;
-    pub use crate::utils::{IntoOnly, Only};
+/// Convert JSON AST back to PRQL string
+pub fn from_json(json: &str) -> Result<String> {
+    let query = serde_json::from_str(json)?;
+    Ok(format!("{}", ast::Item::Query(query)))
 }
 
 #[cfg(test)]
@@ -63,6 +59,41 @@ mod test {
         assert_eq!(json.chars().next().unwrap(), '{');
         assert_eq!(json.chars().nth(json.len() - 1).unwrap(), '}');
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_json() -> Result<()> {
+        // Test that the SQL generated from the JSON of the PRQL is the same as the raw PRQL
+        let original_prql = r#"from employees
+join salaries [emp_no]
+group [emp_no, gender] (
+  aggregate [
+    emp_salary = average salary
+  ]
+)
+join de=dept_emp [emp_no]
+join dm=dept_manager [
+  (dm.dept_no == de.dept_no) and s"(de.from_date, de.to_date) OVERLAPS (dm.from_date, dm.to_date)"
+]
+group [dm.emp_no, gender] (
+  aggregate [
+    salary_avg = average emp_salary,
+    salary_sd = stddev emp_salary
+  ]
+)
+derive mng_no = dm.emp_no
+join managers=employees [emp_no]
+derive mng_name = s"managers.first_name || ' ' || managers.last_name"
+select [mng_name, managers.gender, salary_avg, salary_sd]"#;
+
+        let sql_from_prql = compile(original_prql)?;
+
+        let json = to_json(original_prql)?;
+        let prql_from_json = from_json(&json)?;
+        let sql_from_json = compile(&prql_from_json)?;
+
+        assert_eq!(sql_from_prql, sql_from_json);
         Ok(())
     }
 }

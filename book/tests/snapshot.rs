@@ -4,11 +4,11 @@
 /// - Converts them to SQL using insta, raising an error if there's a diff.
 /// - Replaces the PRQL code block with a comparison table.
 //
-// Overall, this is sligthly overengineered — it's complicated and took a long
-// time to write. The intention is good — have a version of the SQL that's
-// committed into the repo, and join our tests with our docs. But it feels like
-// overly custom code for quite a general problem, even if our preferences are
-// slightly different from the general case.
+// Overall, this is overengineered — it's complicated and took a long time to
+// write. The intention is good — have a version of the SQL that's committed
+// into the repo, and join our tests with our docs. But it feels like overly
+// custom code for quite a general problem, even if our preferences are slightly
+// different from the general case.
 //
 // Possibly we should be using something like pandoc /
 // https://github.com/gpoore/codebraid / which would run the transformation for
@@ -17,8 +17,9 @@
 //
 use anyhow::{bail, Result};
 use globset::Glob;
-use insta::{assert_snapshot, glob};
+use insta::{assert_display_snapshot, assert_snapshot, glob};
 use log::warn;
+use prql_compiler::ast::Item;
 use prql_compiler::*;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use std::fs;
@@ -38,6 +39,7 @@ fn run_examples() -> Result<()> {
     #[cfg(not(target_family = "windows"))]
     write_reference_prql()?;
     run_reference_prql()?;
+    run_display_reference_prql()?;
 
     Ok(())
 }
@@ -128,6 +130,20 @@ fn run_reference_prql() -> Result<()> {
 
         let sql = compile(&prql).unwrap_or_else(|e| format!("Failed to compile `{prql}`; {e}"));
         assert_snapshot!(sql);
+    });
+    Ok(())
+}
+
+/// Snapshot the display trait output of each example.
+fn run_display_reference_prql() -> Result<()> {
+    glob!("prql/**/*.prql", |path| {
+        let prql = fs::read_to_string(path).unwrap();
+
+        if prql.contains("skip_test") {
+            return;
+        }
+
+        assert_display_snapshot!(Item::Query(parse(&prql).unwrap()));
     });
     Ok(())
 }
